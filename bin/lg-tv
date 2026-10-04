@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Control an LG webOS TV's picture brightness over the local network (SSAP).
+
+Usage:
+    lg-tv pair [ip]     Pair with the TV (one-time; accept the prompt on screen)
+    lg-tv get           Print the current backlight value
+    lg-tv set <0-100>   Set the backlight
+    lg-tv off           Skip check: exit 0 if the TV is reachable
+
+Config: ~/.config/theme-set/lg-tv.json  (ip + client key)
+
+Writes use ssap://settings/setSystemSettings when the firmware allows it,
+and fall back to the alert/luna workaround (bscpylgtv-style) when it does not.
+"""
+import json
+import os
+import ssl
+import sys
+import time
+import warnings
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    from websockets.sync.client import connect
+except ImportError:
+    sys.exit("python-websockets is required (sudo pacman -S python-websockets)")
+
+CONFIG = Path.home() / ".config" / "theme-set" / "lg-tv.json"
+CONNECT_TIMEOUT = 3
+REQUEST_TIMEOUT = 6
+PAIR_TIMEOUT = 120
+LUNA_SET = "luna://com.webos.settingsservice/setSystemSettings"
+
+SIGNATURE = (
+    "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbm"
+    "ctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR"
+    "+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRy"
+    "aMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4"
+    "RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n"
+    "50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM"
+    "2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQoj"
+    "oa7NQnAtw=="
+)
+
+MANIFEST = {
+    "appVersion": "1.1",
+    "manifestVersion": 1,
+    "deviceName": "theme-set",
+    "permissions": [
+        "LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CLOSE", "TEST_OPEN",
+        "TEST_PROTECTED", "CONTROL_AUDIO", "CONTROL_DISPLAY",
+        "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_RECORDING",
+        "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV", "CONTROL_POWER",
+        "CONTROL_TV_SCREEN", "READ_APP_STATUS", "READ_CURRENT_CHANNEL",
+        "READ_INPUT_DEVICE_LIST", "READ_NETWORK_STATE", "READ_RUNNING_APPS",
+        "READ_TV_CHANNEL_LIST", "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE",
+        "READ_COUNTRY_INFO", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD",
+        "READ_INSTALLED_APPS", "READ_SETTINGS", "READ_STORAGE_DEVICE_LIST",
+    ],
+    "signatures": [{"signature": SIGNATURE, "signatureVersion": 1}],
+    "signed": {
+        "appId": "com.lge.test",
+        "created": "20140509",
+        "localizedAppNames": {"": "LG Remote App", "ko-KR": "\ub9ac\ubaa8\ucee8 \uc571",
+                              "zxx-XX": "\u041b\u0413 R\u044d\u043cot\u044d A\u041f\u041f"},
+        "localizedVendorNames": {"": "LG Electronics"},
+        "permissions": [
+            "TEST_SECURE", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD",
+            "READ_INSTALLED_APPS", "READ_LGE_SDX", "READ_NOTIFICATIONS",
+            "SEARCH", "WRITE_SETTINGS", "WRITE_NOTIFICATION_ALERT",
+            "CONTROL_POWER", "READ_CURRENT_CHANNEL", "READ_RUNNING_APPS",
+            "READ_UPDATE_INFO", "UPDATE_FROM_REMOTE_APP",
+            "READ_LGE_TV_INPUT_EVENTS", "READ_TV_CURRENT_TIME",
+        ],
+        "serial": "2f930e2d2cfe083771f68e4fe7bb07",
+        "vendorId": "com.lge",
+    },
+}
+
+
+def load_config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError as exc:
+        sys.exit(f"invalid config {CONFIG}: {exc}")
+
+
+def save_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    CONFIG.chmod(0o600)
+
+
+def connect_tv(ip):
+    ctx = ssl._create_unverified_context()
+    last = None
+    for uri in (f"wss://{ip}:3001", f"ws://{ip}:3000"):
+        try:
+            return connect(uri, ssl=ctx, open_timeout=CONNECT_TIMEOUT,
+                           close_timeout=2, max_size=None)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+    raise ConnectionError(f"TV at {ip} unreachable: {last}")
+
+
+def wait_for(ws, pred, timeout, desc):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            raw = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+        except TimeoutError:
+            break
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        if pred(msg):
+            return msg
+    raise TimeoutError(f"timed out waiting for {desc}")
+
+
+_counter = 0
+
+
+def request(ws, uri, payload=None, timeout=REQUEST_TIMEOUT):
+    global _counter
+    _counter += 1
+    mid = f"req_{_counter}"
+    ws.send(json.dumps({"id": mid, "type": "request", "uri": uri, "payload": payload or {}}))
+    return wait_for(ws, lambda m: m.get("type") == "response" and m.get("id") == mid,
+                    timeout, uri)
+
+
+def register(ws, key, prompt=False):
+    payload = {"forcePairing": False, "pairingType": "PROMPT",
+               "manifest": MANIFEST, "client-key": key}
+    ws.send(json.dumps({"id": "register_0", "type": "register", "payload": payload}))
+    deadline = time.monotonic() + (PAIR_TIMEOUT if prompt else REQUEST_TIMEOUT)
+    while time.monotonic() < deadline:
+        try:
+            raw = ws.recv(timeout=max(0.1, deadline - time.monotonic()))
+        except TimeoutError:
+            break
+        msg = json.loads(raw)
+        if msg.get("type") == "registered":
+            return msg["payload"].get("client-key") or key
+        if msg.get("type") == "error":
+            raise PermissionError(msg.get("error", "registration failed"))
+    raise PermissionError("not registered (invalid key or pairing timeout)")
+
+
+def read_backlight(ws):
+    msg = request(ws, "ssap://settings/getSystemSettings",
+                  {"category": "picture", "keys": ["backlight"]})
+    return int((msg.get("payload") or {}).get("settings", {}).get("backlight"))
+
+
+def direct_write(ws, value):
+    msg = request(ws, "ssap://settings/setSystemSettings",
+                  {"category": "picture", "settings": {"backlight": value}})
+    return bool((msg.get("payload") or {}).get("returnValue"))
+
+
+def alert_write(ws, value):
+    params = {"category": "picture", "settings": {"backlight": value}}
+    alert = {
+        "message": " ",
+        "buttons": [{"label": "", "onClick": LUNA_SET, "params": params}],
+        "onclose": {"uri": LUNA_SET, "params": params},
+        "onfail": {"uri": LUNA_SET, "params": params},
+    }
+    created = request(ws, "ssap://system.notifications/createAlert", alert)
+    alert_id = (created.get("payload") or {}).get("alertId")
+    if not alert_id:
+        return False
+    request(ws, "ssap://system.notifications/closeAlert", {"alertId": alert_id})
+    return True
+
+
+def write_backlight(ws, value):
+    if direct_write(ws, value):
+        return True
+    return alert_write(ws, value)
+
+
+def cmd_pair(args):
+    cfg = load_config()
+    ip = args[0] if args else cfg.get("ip")
+    if not ip:
+        sys.exit("usage: lg-tv pair <ip>")
+    print(f"Connecting to {ip}; accept the pairing prompt on the TV...")
+    ws = connect_tv(ip)
+    try:
+        key = register(ws, cfg.get("client_key"), prompt=True)
+    finally:
+        ws.close()
+    cfg.update({"ip": ip, "client_key": key})
+    save_config(cfg)
+    print(f"Paired. Config saved to {CONFIG}")
+    return 0
+
+
+def cmd_get(_args):
+    cfg = load_config()
+    if not cfg.get("ip") or not cfg.get("client_key"):
+        sys.exit("not paired yet; run: lg-tv pair <ip>")
+    ws = connect_tv(cfg["ip"])
+    try:
+        register(ws, cfg["client_key"])
+        print(read_backlight(ws))
+    finally:
+        ws.close()
+    return 0
+
+
+def cmd_set(args):
+    if len(args) != 1:
+        sys.exit("usage: lg-tv set <0-100>")
+    value = int(args[0])
+    if not 0 <= value <= 100:
+        sys.exit("brightness must be 0-100")
+    cfg = load_config()
+    if not cfg.get("ip") or not cfg.get("client_key"):
+        sys.exit("not paired yet; run: lg-tv pair <ip>")
+    ws = connect_tv(cfg["ip"])
+    try:
+        register(ws, cfg["client_key"])
+        if not write_backlight(ws, value):
+            sys.exit("TV rejected the brightness change")
+        current = read_backlight(ws)
+        if current != value:
+            sys.exit(f"brightness read back as {current}, expected {value}")
+        print(current)
+    finally:
+        ws.close()
+    return 0
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in {"pair", "get", "set"}:
+        sys.exit(__doc__.strip())
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+    try:
+        if cmd == "pair":
+            return cmd_pair(args)
+        if cmd == "get":
+            return cmd_get(args)
+        return cmd_set(args)
+    except (ConnectionError, PermissionError, TimeoutError, OSError) as exc:
+        sys.exit(str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

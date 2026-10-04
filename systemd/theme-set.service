@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply the time-appropriate light or dark theme
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/theme-set auto
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# Apply the desktop + app theme.
+# Usage: theme-set [--brightness-only] dark | light | auto
+#
+# "auto" picks dark from 20:00 to 08:00 and light from 08:00 to 20:00,
+# in US Eastern time (matching the systemd timer schedule).
+# Also sets monitor brightness (DDC/CI) and the LG TV backlight (webOS SSAP).
+#
+# --brightness-only skips the theme/Ghostty parts and only reconciles
+# display brightness (used by the monitor-wake hook).
+
+set -u
+
+TIMEZONE="America/New_York"
+
+# Monitor brightness per mode, in percent (0-100), applied via DDC/CI.
+# Requires ddcutil; displays that do not support it are skipped.
+BRIGHTNESS_DARK=30
+BRIGHTNESS_LIGHT=80
+
+# LG TV brightness per mode (webOS SSAP). Needs a one-time `lg-tv pair`.
+TV_BRIGHTNESS_DARK=30
+TV_BRIGHTNESS_LIGHT=80
+
+brightness_only=0
+args=()
+for arg in "$@"; do
+    case "$arg" in
+        --brightness-only) brightness_only=1 ;;
+        *) args+=("$arg") ;;
+    esac
+done
+mode="${args[0]:-auto}"
+
+if [[ "$mode" == "auto" ]]; then
+    hour="$(TZ="$TIMEZONE" date +%H)"
+    if (( 10#$hour >= 20 || 10#$hour < 8 )); then
+        mode=dark
+    else
+        mode=light
+    fi
+fi
+
+case "$mode" in
+    dark|light) ;;
+    *)
+        echo "usage: theme-set [--brightness-only] {dark|light|auto}" >&2
+        exit 2
+        ;;
+esac
+
+log() {
+    echo "theme-set[$mode]: $*" >&2
+}
+
+# systemd user services do not always inherit the session D-Bus address,
+# which gsettings/dconf needs.
+if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "/run/user/$(id -u)/bus" ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+fi
+
+# Tell a running Ghostty to reload its config (same as ctrl+shift+,)
+# so it picks up the new theme symlink without restarting.
+reload_ghostty() {
+    # Prefer the systemd user service if Ghostty was started through it.
+    if systemctl --user is-active --quiet app-com.mitchellh.ghostty.service 2>/dev/null; then
+        systemctl --user reload app-com.mitchellh.ghostty.service 2>/dev/null && return 0
+    fi
+
+    # Otherwise signal the Ghostty process directly. Ghostty handles
+    # SIGUSR2 by reloading its configuration.
+    pkill -USR2 -x ghostty 2>/dev/null || true
+}
+
+# I2C bus numbers of displays that actually respond to DDC/CI.
+ddcutil_buses() {
+    ddcutil detect --brief 2>/dev/null | awk '
+        /^Display [0-9]+/   { valid = 1; next }
+        /^Invalid display/ { valid = 0; next }
+        valid && /I2C bus:/ { print $NF }
+    ' | sed 's|.*/dev/i2c-||'
+}
+
+# Set all DDC/CI-capable monitors to the given brightness percent.
+# Never fails the script; missing ddcutil or unresponsive displays are skipped.
+set_brightness() {
+    local percent="$1"
+
+    if ! command -v ddcutil >/dev/null 2>&1; then
+        log "ddcutil not installed; skipping monitor brightness"
+        return 0
+    fi
+
+    local buses
+    buses="$(ddcutil_buses)"
+    if [[ -z "$buses" ]]; then
+        log "no DDC displays detected; retrying in 3s"
+        sleep 3
+        buses="$(ddcutil_buses)"
+    fi
+    if [[ -z "$buses" ]]; then
+        log "no DDC displays detected; monitor brightness not set"
+        return 0
+    fi
+
+    local bus max value current attempt
+    for bus in $buses; do
+        max="$(ddcutil --bus "$bus" getvcp 10 --brief 2>/dev/null | awk '{print $NF}')"
+        [[ "$max" =~ ^[0-9]+$ ]] || max=100
+        value=$(( percent * max / 100 ))
+
+        for attempt in 1 2 3; do
+            current="$(ddcutil --bus "$bus" getvcp 10 --brief 2>/dev/null | awk '{print $4}')"
+            if [[ "$current" == "$value" ]]; then
+                log "bus $bus already at $value"
+                break
+            fi
+            ddcutil --bus "$bus" setvcp 10 "$value" --noverify >/dev/null 2>&1 || true
+            sleep 0.5
+            current="$(ddcutil --bus "$bus" getvcp 10 --brief 2>/dev/null | awk '{print $4}')"
+            if [[ "$current" == "$value" ]]; then
+                log "bus $bus set to $value (attempt $attempt)"
+                break
+            fi
+            log "bus $bus attempt $attempt failed (current=${current:-unknown}, target=$value)"
+        done
+        if [[ "${current:-}" != "$value" ]]; then
+            log "bus $bus could not be set to $value (still ${current:-unknown})"
+        fi
+    done
+}
+
+# Set the LG TV backlight; skipped if the TV is off or not paired.
+set_tv_brightness() {
+    local percent="$1"
+    if [[ ! -x "$HOME/.local/bin/lg-tv" ]]; then
+        log "lg-tv not installed; skipping TV brightness"
+        return 0
+    fi
+    local out
+    if out="$(timeout 8 "$HOME/.local/bin/lg-tv" set "$percent" 2>&1)"; then
+        log "TV backlight set to $percent"
+    else
+        log "TV brightness not set (${out:-unreachable})"
+    fi
+}
+
+apply_brightness() {
+    if [[ "$mode" == "dark" ]]; then
+        set_brightness "$BRIGHTNESS_DARK"
+        set_tv_brightness "$TV_BRIGHTNESS_DARK"
+    else
+        set_brightness "$BRIGHTNESS_LIGHT"
+        set_tv_brightness "$TV_BRIGHTNESS_LIGHT"
+    fi
+}
+
+log "start (brightness-only=$brightness_only)"
+
+if [[ "$brightness_only" == 1 ]]; then
+    apply_brightness
+    exit 0
+fi
+
+gsettings set org.gnome.desktop.interface color-scheme "prefer-$mode"
+gsettings set org.gnome.desktop.interface gtk-theme "Adwaita"
+
+# Point Ghostty at the theme for this mode. Its config includes
+# ~/.config/ghostty/current-theme.conf via `config-file =`.
+ghostty_theme="$HOME/.config/ghostty/themes/$mode.conf"
+if [[ -f "$ghostty_theme" ]]; then
+    ln -sf "$ghostty_theme" "$HOME/.config/ghostty/current-theme.conf"
+    log "ghostty theme -> $mode"
+else
+    log "ghostty theme file not found: $ghostty_theme"
+fi
+
+reload_ghostty
+
+apply_brightness

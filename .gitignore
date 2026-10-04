@@ -1,0 +1,15 @@
+# Runtime config / secrets (TV pairing key)
+lg-tv.json
+*.client-key
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

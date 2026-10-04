@@ -1,0 +1,10 @@
+[Unit]
+Description=Switch theme at 08:00 (light) and 20:00 (dark), US Eastern
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 America/New_York
+OnCalendar=*-*-* 20:00:00 America/New_York
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
